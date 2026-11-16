@@ -4,10 +4,13 @@ namespace Tests\Feature;
 
 use App\Http\Middleware\EnsureInstallationModules;
 use App\Livewire\Admin\InstallationSetup;
+use App\Livewire\Admin\InsightSharing;
 use App\Models\ClientLicense;
 use App\Models\SystemSetting;
 use App\Models\User;
 use App\Services\InstallationAdministrator;
+use App\Services\InsightCategoryCatalog;
+use App\Services\InsightReleaseReadiness;
 use App\Services\LicenseService;
 use App\Services\SystemBranding;
 use Illuminate\Database\Schema\Blueprint;
@@ -93,6 +96,213 @@ class InstallationSetupTest extends TestCase
         $user->roles()->attach(1);
         $this->actingAs($user)->get('/admin/installation')->assertForbidden();
         Livewire::actingAs($user)->test(InstallationSetup::class)->assertForbidden();
+        $this->actingAs($user)->get('/admin/insight-sharing')->assertForbidden();
+        Livewire::actingAs($user)->test(InsightSharing::class)->assertForbidden();
+    }
+
+    public function test_insight_catalog_filters_only_by_enabled_modules(): void
+    {
+        $catalog = app(InsightCategoryCatalog::class);
+        $keys = fn (array $modules): array => array_column($catalog->forModules($modules), 'key');
+        $pharmacy = $keys(['access_control', 'billing', 'pharmacy', 'finance']);
+        $this->assertContains('medicine_stock', $pharmacy);
+        $this->assertContains('expenses', $pharmacy);
+        $this->assertNotContains('patients', $pharmacy);
+        $this->assertNotContains('investigations', $pharmacy);
+
+        $clinic = $keys(['patient_records', 'clinical_care', 'doctor', 'billing']);
+        $this->assertContains('patients', $clinic);
+        $this->assertContains('visits', $clinic);
+        $this->assertContains('prescriptions', $clinic);
+        $this->assertContains('labour_services', $clinic);
+        $this->assertContains('surgery', $clinic);
+        $this->assertNotContains('medicine_stock', $clinic);
+        $this->assertNotContains('labours', $clinic);
+        $this->assertNotContains('deliveries', $clinic);
+
+        $diagnostics = $keys(['patient_records', 'laboratory', 'radiology']);
+        $this->assertSame(1, count(array_filter($diagnostics, fn ($key) => $key === 'investigations')));
+        $this->assertNotContains('prescriptions', $diagnostics);
+        $this->assertNotContains('labour_services', $diagnostics);
+        $this->assertNotContains('surgery', $diagnostics);
+        $maternity = $keys(['maternity']);
+        $this->assertContains('labour_episodes', $maternity);
+        $this->assertContains('deliveries', $maternity);
+        $this->assertContains('postnatal_examinations', $maternity);
+        $hospital = $keys(array_keys(config('mediflow_modules.features')));
+        $this->assertContains('newborns', $hospital);
+        $this->assertContains('consumable_stock', $hospital);
+        $this->assertCount(count(array_unique($hospital)), $hospital);
+        $this->assertSame([], $keys([]));
+        $descriptions = array_column($catalog->forModules(array_keys(config('mediflow_modules.features'))), 'description', 'key');
+        $this->assertStringContainsString('drug charts', $descriptions['care']);
+        $this->assertStringContainsString('all labour services', $descriptions['labour_services']);
+        $this->assertStringContainsString('services in the surgery category', $descriptions['surgery']);
+        $this->assertStringContainsString('used and remaining', $descriptions['consumable_stock']);
+    }
+
+    public function test_insight_sharing_preview_requires_verified_license_and_never_enables_sharing(): void
+    {
+        $admin = $this->admin();
+        Livewire::actingAs($admin)->test(InsightSharing::class)
+            ->assertSee('A usable verified KernelBridge license is required')
+            ->assertDontSee('Enable synchronization for Patients');
+
+        $this->mock(InsightCategoryCatalog::class)
+            ->shouldReceive('availableForInstallation')->andReturn([
+                ['key' => 'patients', 'label' => 'Patients', 'description' => 'New patient registrations by registration date.'],
+            ]);
+        Livewire::actingAs($admin)->test(InsightSharing::class)
+            ->assertSee('No categories can be enabled')
+            ->assertSee('Insight synchronization')
+            ->assertSee('Release status: Pending privacy review')
+            ->assertSee('The release has not been reviewed or approved.')
+            ->assertSee('A privacy specialist must review the release design and set the lifetime privacy budget.')
+            ->assertSee('Hospital consent, withdrawal and Platform deletion are not implemented.')
+            ->assertSee('Enable synchronization for Patients')
+            ->assertSee('Not available yet; synchronization is off.')
+            ->assertSeeHtml('type="checkbox" disabled');
+        $screen = Livewire::actingAs($admin)->test(InsightSharing::class);
+        $admin->is_installation_admin = false;
+        $admin->saveQuietly();
+        $screen->call('$refresh')->assertForbidden();
+    }
+
+    public function test_insight_release_remains_pending_review_even_if_sync_flags_are_enabled(): void
+    {
+        config([
+            'operational_sync.management_enabled' => true,
+            'operational_sync.connector_enabled' => true,
+            'operational_summary_sync.enabled' => true,
+        ]);
+        $readiness = app(InsightReleaseReadiness::class)->status();
+        $this->assertSame('pending_privacy_review', $readiness['status']);
+        $this->assertFalse($readiness['can_release']);
+        $this->assertCount(4, $readiness['blockers']);
+
+        Livewire::actingAs($this->admin())->test(InsightSharing::class)
+            ->assertSee('Release status: Pending privacy review')
+            ->assertSee('Aggregate releases and corrections are disabled.')
+            ->assertSee('Aggregate delivery, Platform ingestion and reporting are not implemented.');
+    }
+
+    public function test_daily_insight_preview_is_local_suppressed_and_limited_to_licensed_categories(): void
+    {
+        config(['app.timezone' => 'UTC']);
+        $this->travelTo(now()->setDate(2026, 11, 12)->startOfDay()->addHours(12));
+        Schema::create('patients', function (Blueprint $table): void {
+            $table->id();
+            $table->dateTime('registration_date');
+            $table->softDeletes();
+        });
+        foreach (range(1, 4) as $id) {
+            DB::table('patients')->insert(['id' => $id, 'registration_date' => '2026-11-11 12:00:00']);
+        }
+        $categories = [
+            ['key' => 'patients', 'label' => 'Patients', 'description' => 'New registrations.'],
+        ];
+        $this->mock(InsightCategoryCatalog::class)->shouldReceive('availableForInstallation')
+            ->andReturnUsing(function () use (&$categories) { return $categories; });
+        $screen = Livewire::actingAs($this->admin())->test(InsightSharing::class)
+            ->assertSee('Nothing is saved or sent to the Platform')
+            ->set('previewCategory', 'patients')
+            ->call('preview')
+            ->assertHasNoErrors()
+            ->assertSee('Suppressed (fewer than five distinct patients).')
+            ->assertSet('previewResult.value', null);
+
+        DB::table('patients')->insert(['id' => 5, 'registration_date' => '2026-11-11 12:00:00']);
+        $screen->call('preview')->assertSet('previewResult.value', 5);
+        $categories = [];
+        $screen->call('$refresh')->assertSet('previewResult', null);
+        $categories = [['key' => 'patients', 'label' => 'Patients', 'description' => 'New registrations.']];
+        $screen->set('previewDate', '2026-11-12')->assertSet('previewResult', null)
+            ->call('preview')->assertHasErrors(['previewDate']);
+        $screen->set('previewDate', '2026-11-11')->set('previewCategory', 'care')
+            ->call('preview')->assertHasErrors(['previewCategory'])->assertSet('previewResult', null);
+    }
+
+    public function test_daily_insight_preview_rechecks_license_before_calculation(): void
+    {
+        $this->mock(InsightCategoryCatalog::class)->shouldReceive('availableForInstallation')->andReturn(null);
+        Livewire::actingAs($this->admin())->test(InsightSharing::class)
+            ->set('previewCategory', 'patients')
+            ->call('preview')
+            ->assertHasErrors(['previewCategory'])
+            ->assertSet('previewResult', null);
+    }
+
+    public function test_maternity_preview_is_shown_only_for_the_enabled_module_and_stays_local(): void
+    {
+        config(['app.timezone' => 'UTC']);
+        $this->travelTo(now()->setDate(2026, 11, 12)->startOfDay()->addHours(12));
+        Schema::create('patients', function (Blueprint $table): void {
+            $table->id();
+            $table->softDeletes();
+        });
+        Schema::create('deliveries', function (Blueprint $table): void {
+            $table->id();
+            $table->unsignedBigInteger('patient_id');
+            $table->dateTime('delivery_date_time');
+            $table->softDeletes();
+        });
+        foreach (range(1, 5) as $id) {
+            DB::table('patients')->insert(['id' => $id]);
+            DB::table('deliveries')->insert(['patient_id' => $id, 'delivery_date_time' => '2026-11-11 12:00:00']);
+        }
+        DB::table('deliveries')->insert(['patient_id' => 1, 'delivery_date_time' => '2026-11-11 13:00:00']);
+        $categories = app(InsightCategoryCatalog::class)->forModules(['maternity']);
+        $this->mock(InsightCategoryCatalog::class)->shouldReceive('availableForInstallation')
+            ->andReturnUsing(function () use (&$categories) { return $categories; });
+        $screen = Livewire::actingAs($this->admin())->test(InsightSharing::class)
+            ->assertSee('Labour episodes are separate from services named labor')
+            ->set('previewCategory', 'deliveries')
+            ->call('preview')->assertHasNoErrors()->assertSet('previewResult.value', 6)
+            ->assertSee('No categories can be enabled');
+        $screen->set('previewDistinctPatients', true)->assertSet('previewResult', null)
+            ->call('preview')->assertHasNoErrors()->assertSet('previewResult.value', 5)
+            ->assertSet('previewResult.unit', 'patients')
+            ->assertSee('not a differentially private release');
+        $categories = [];
+        $screen->call('$refresh')->assertSet('previewResult', null)
+            ->set('previewCategory', 'deliveries')->call('preview')
+            ->assertHasErrors(['previewCategory']);
+    }
+
+    public function test_operational_retry_screen_is_gated_and_audited(): void
+    {
+        (require database_path('migrations/2026_11_11_000010_create_operational_sync_outbox.php'))->up();
+        $eventId = (string) \Illuminate\Support\Str::uuid();
+        DB::table('operational_sync_outbox')->insert([
+            'id' => $eventId, 'sequence' => 1, 'payload_json' => '{"secret":"never display"}',
+            'payload_sha256' => str_repeat('a', 64), 'occurred_at' => now(), 'status' => 'failed',
+            'attempts' => 10, 'last_error_code' => 'remote_rejected', 'created_at' => now(), 'updated_at' => now(),
+        ]);
+        $admin = $this->admin();
+        Livewire::actingAs($admin)->test(InstallationSetup::class)
+            ->assertDontSee('Operational sync')->call('retryOperationalEvent', $eventId)->assertNotFound();
+        config(['operational_sync.management_enabled' => true]);
+        Livewire::actingAs($admin)->test(InstallationSetup::class)
+            ->assertSeeHtml('id="operational-sync"')->assertSee('Platform under Operational sync')
+            ->assertSee('Failed: 1')->assertSee('remote_rejected')->assertDontSee('never display')
+            ->call('retryOperationalEvent', $eventId)->assertHasNoErrors()->assertSee('Retry requested')
+            ->assertSee('Failed: 0');
+        $this->assertDatabaseHas('operational_sync_outbox', ['id' => $eventId, 'status' => 'pending', 'attempts' => 0]);
+        $this->assertDatabaseHas('audit_logs', ['actor_id' => $admin->id, 'action' => 'operational_sync.retry_requested']);
+    }
+
+    public function test_operational_enrollment_requires_admin_and_does_not_flash_secret_on_invalid_input(): void
+    {
+        $admin = $this->admin();
+        $url = route('admin.installation.operational-sync.enroll');
+        $this->actingAs($admin)->post($url, ['sync_code' => 'sensitive-invalid-value'])->assertNotFound();
+        config(['operational_sync.management_enabled' => true]);
+        $this->actingAs($admin)->post($url, ['sync_code' => 'sensitive-invalid-value'])
+            ->assertRedirect(route('admin.installation'))->assertSessionHasErrors('sync_code');
+        $this->assertNull(session()->getOldInput('sync_code'));
+        $admin->is_installation_admin = false;
+        $admin->saveQuietly();
+        $this->actingAs($admin)->post($url, ['sync_code' => str_repeat('c', 43)])->assertForbidden();
     }
 
     public function test_super_admin_can_save_a_package_and_explicit_module_selection(): void

@@ -21,6 +21,9 @@
         <env name="APP_ENV" value="testing"/>
         <env name="APP_MODE" value="standalone" force="true"/>
         <env name="MEDIFLOW_CENTRAL_LICENSING" value="false" force="true"/>
+        <env name="OPERATIONAL_SYNC_MANAGEMENT_ENABLED" value="false" force="true"/>
+        <env name="OPERATIONAL_SYNC_CONNECTOR_ENABLED" value="false" force="true"/>
+        <env name="OPERATIONAL_SYNC_ALLOW_INSECURE_IP_HTTP" value="false" force="true"/>
         <env name="APP_MAINTENANCE_DRIVER" value="file"/>
         <env name="BCRYPT_ROUNDS" value="4"/>
         <env name="BROADCAST_CONNECTION" value="null"/>

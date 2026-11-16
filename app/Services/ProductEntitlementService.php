@@ -244,6 +244,13 @@ final class ProductEntitlementService
             'license_usable' => $usable,
             'license_status' => $state->status,
             'license_reason' => $usable ? 'active' : $this->cache->activationRequirementReason(),
+            'activation_source' => $state->credential_kind === 'installation_bearer'
+                ? (is_string($claims['platform_account_link_uuid'] ?? null) ? 'platform_account' : 'direct')
+                : ($state->encrypted_license_key ? 'legacy_key' : null),
+            'licensing_mode' => is_string($claims['licensing_mode'] ?? null) ? $claims['licensing_mode'] : null,
+            'installation_uuid' => $state->installation_identifier,
+            'signature_verified' => $claims !== null,
+            'snapshot_issued_at' => $issuedAt?->toIso8601String(),
             'source' => $framework['source'] ?? ($state->credential_kind === 'installation_bearer' ? 'legacy' : null),
             'catalog_revision' => $framework['catalog_revision'] ?? null,
             'source_revision' => $framework['source_revision'] ?? null,

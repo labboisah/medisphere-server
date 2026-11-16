@@ -2,6 +2,7 @@
 
 namespace App\Http\Controllers;
 
+use App\Services\InstallationBinding;
 use App\Services\InstallationOnboarding;
 use App\Services\LicensingConnection;
 use Illuminate\Http\Request;
@@ -35,6 +36,10 @@ class InstallationActivationController extends Controller
             }
         }
 
+        if ($licensingPolicy && ($licensingPolicy['licensing_mode'] ?? null) === 'platform_account') {
+            return $this->platformActivation($request, $cache, $onboarding);
+        }
+
         return view('kernelbridge-licensing::activation', [
             'state' => $cache->state(),
             'hasUsableLicense' => $cache->hasUsableLicense(),
@@ -45,6 +50,24 @@ class InstallationActivationController extends Controller
             'legacyActivationEnabled' => (bool) config('kernelbridge-licensing.legacy_activation_enabled', false),
             'licensingPolicy' => $licensingPolicy,
             'licensingPolicyError' => $licensingPolicyError,
+            'platformActivationUrl' => $this->platformActivationUrl(),
+            'needsLogin' => $onboarding->hasAdministrator() && ! $request->user()?->is_installation_admin,
+        ]);
+    }
+
+    public function platformAccount(Request $request, LicenseCacheService $cache, InstallationOnboarding $onboarding)
+    {
+        if ($cache->hasUsableLicense()) {
+            return redirect()->route('kernelbridge.license.show');
+        }
+
+        return $this->platformActivation($request, $cache, $onboarding);
+    }
+
+    private function platformActivation(Request $request, LicenseCacheService $cache, InstallationOnboarding $onboarding)
+    {
+        return view('installation.platform-activation', [
+            'installationUuid' => $cache->state()->installation_identifier,
             'platformActivationUrl' => $this->platformActivationUrl(),
             'needsLogin' => $onboarding->hasAdministrator() && ! $request->user()?->is_installation_admin,
         ]);
@@ -72,11 +95,15 @@ class InstallationActivationController extends Controller
         $data = $request->validate([
             'activation_code' => ['required_without:license_key', 'string', 'max:255'],
             'license_key' => ['required_without:activation_code', 'string', 'max:255'],
+            'installation_uuid' => ['nullable', 'string', 'max:36', 'missing_with:license_key'],
             'device_name' => ['nullable', 'string', 'max:255'],
             'server_url' => ['sometimes', 'required', 'url:http,https', 'max:2048'],
         ]);
         $connection = app(LicensingConnection::class);
         $serverUrl = $connection->select($data['server_url'] ?? null);
+        if (filled($data['activation_code'] ?? null) && filled($data['installation_uuid'] ?? null)) {
+            app(InstallationBinding::class)->bind($data['installation_uuid']);
+        }
         try {
             if (filled($data['activation_code'] ?? null)) {
                 $activation->activateWithCode($data['activation_code'], $data['device_name'] ?? config('app.name'));

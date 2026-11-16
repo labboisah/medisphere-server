@@ -2,18 +2,22 @@
 
 namespace Tests\Feature;
 
-use App\Http\Middleware\EnsureCentralLicense;
-use App\Http\Middleware\EnsureInstallationModules;
 use App\Http\Middleware\CheckPermission;
 use App\Http\Middleware\CheckRole;
 use App\Http\Middleware\CheckRoleOrPermission;
+use App\Http\Middleware\EnsureCentralLicense;
+use App\Http\Middleware\EnsureInstallationModules;
 use App\Livewire\Dashboard;
+use App\Models\Role;
 use App\Models\User;
 use App\Providers\CentralLicensingServiceProvider;
 use App\Services\CentralLicenseService;
+use App\Services\InstallationCatalog;
 use App\Services\InstallationOnboarding;
 use App\Services\LicenseService;
 use App\Services\ProductEntitlementService;
+use App\Services\OperationalSyncLicenseProof;
+use App\Exceptions\OperationalSyncEnrollmentException;
 use App\Services\SidebarService;
 use Dotenv\Repository\Adapter\PutenvAdapter;
 use Dotenv\Repository\RepositoryBuilder;
@@ -27,11 +31,13 @@ use Illuminate\Support\Facades\Hash;
 use Illuminate\Support\Facades\Http;
 use Illuminate\Support\Facades\Schema;
 use Illuminate\Support\Facades\Storage;
+use Illuminate\Support\Str;
+use Illuminate\Validation\ValidationException;
 use KernelBridge\LicensingClient\Services\DeviceIdentity;
 use KernelBridge\LicensingClient\Services\LicenseCacheService;
+use KernelBridge\LicensingClient\Services\LicenseVerificationService;
 use Symfony\Component\HttpFoundation\Response;
 use Symfony\Component\HttpKernel\Exception\HttpException;
-use Illuminate\Validation\ValidationException;
 use Tests\TestCase;
 
 class CentralLicensingTest extends TestCase
@@ -224,6 +230,34 @@ class CentralLicensingTest extends TestCase
         $this->assertSame('https://licensing.test/api/v1', Storage::disk('local')->get('licensing/server-url.txt'));
     }
 
+    public function test_sync_proof_uses_installation_credential_and_requires_trusted_challenge_signature(): void
+    {
+        config(['kernelbridge-licensing.deployment.strict_profile' => false]);
+        $this->activateWithFramework([], ['core']);
+        $id = $this->cache->state()->installation_identifier;
+        $keys = sodium_crypto_sign_keypair();
+        config(['kernelbridge-licensing.entitlement_public_keys.proof-test' => base64_encode(sodium_crypto_sign_publickey($keys))]);
+        $challenge = hash('sha256', 'synthetic sync code');
+        $claims = json_encode([
+            'purpose' => 'mediflow.operational-sync.enrollment',
+            'challenge' => $challenge, 'installation_uuid' => $id,
+        ], JSON_THROW_ON_ERROR);
+        $proof = [
+            'payload_json' => $claims,
+            'signature' => base64_encode(sodium_crypto_sign_detached($claims, sodium_crypto_sign_secretkey($keys))),
+            'algorithm' => 'ed25519', 'key_id' => 'proof-test',
+        ];
+        Http::fake(['*' => Http::sequence()->push(['success' => true, 'data' => $proof])
+            ->push(['success' => true, 'data' => [...$proof, 'signature' => base64_encode(random_bytes(64))]])]);
+        $result = app(OperationalSyncLicenseProof::class)->create($challenge);
+        $this->assertSame($id, $result['installation_uuid']);
+        Http::assertSent(fn (ClientRequest $request): bool => str_ends_with($request->url(), '/installations/operational-sync-proof')
+            && $request->hasHeader('Authorization', 'Bearer '.$id.'.framework-test-secret')
+            && $request['challenge'] === $challenge);
+        $this->expectException(OperationalSyncEnrollmentException::class);
+        app(OperationalSyncLicenseProof::class)->create($challenge);
+    }
+
     public function test_central_activation_uses_package_dashboard_without_legacy_license_record(): void
     {
         $this->activate();
@@ -360,9 +394,9 @@ class CentralLicensingTest extends TestCase
         $this->assertFalse($user->hasPermission('patient.read'));
         $this->assertFalse($user->hasAnyPermission(['patient.read']));
         $this->assertFalse($user->hasRole('doctor'));
-        $catalog = app(\App\Services\InstallationCatalog::class);
+        $catalog = app(InstallationCatalog::class);
         $this->assertSame([1], $catalog->permissions()->pluck('id')->all());
-        $this->assertSame([2], $catalog->retainedUnavailablePermissionIds(\App\Models\Role::findOrFail(1)));
+        $this->assertSame([2], $catalog->retainedUnavailablePermissionIds(Role::findOrFail(1)));
         $catalog->roleInput('custom_staff', [1]);
         try {
             $catalog->roleInput('custom_staff', [1, 2]);
@@ -563,6 +597,258 @@ class CentralLicensingTest extends TestCase
         $this->assertFalse($service->moduleEnabled('pharmacy'));
         $this->assertDatabaseCount('users', 1);
         $this->assertDatabaseHas('system_settings', ['brand_name' => 'Example Clinic']);
+    }
+
+    public function test_platform_account_activation_stores_credential_and_exposes_only_safe_status(): void
+    {
+        $uuid = $this->cache->state()->installation_identifier;
+        $signed = $this->platformSnapshot(['platform_account_link_uuid' => 'link-1', 'licensing_mode' => 'platform_account']);
+        Http::fake(['*' => Http::response(['success' => true, 'data' => $this->exchangeBody($uuid, $signed)], 201)]);
+
+        $this->post('/license', ['activation_code' => 'KBI-PLATFORM', 'server_url' => 'https://licensing.test'])
+            ->assertRedirect(route('installation.setup'));
+
+        Http::assertSent(fn (ClientRequest $request): bool => str_ends_with($request->url(), '/installations/activate')
+            && $request->data()['activation_code'] === 'KBI-PLATFORM'
+            && $request->data()['product_code'] === 'MEDIFLOW'
+            && $request->data()['installation_uuid'] === $uuid
+            && ! $request->hasHeader('Authorization'));
+        $state = $this->cache->state();
+        $this->assertSame('installation_bearer', $state->credential_kind);
+        $this->assertSame($uuid.'.platform-secret', $state->encrypted_installation_credential);
+        $diagnostics = app(ProductEntitlementService::class)->diagnostics();
+        $this->assertSame('platform_account', $diagnostics['activation_source']);
+        $this->assertSame('platform_account', $diagnostics['licensing_mode']);
+        $this->assertSame($uuid, $diagnostics['installation_uuid']);
+        $this->assertTrue($diagnostics['signature_verified']);
+        $this->assertNotNull($diagnostics['snapshot_issued_at']);
+        $this->assertNotNull($diagnostics['offline_grace_expires_at']);
+        $this->assertStringNotContainsString('platform-secret', json_encode($diagnostics));
+        $this->assertStringNotContainsString('KBI-PLATFORM', json_encode($diagnostics));
+    }
+
+    public function test_platform_activation_rejects_wrong_installation_or_product_binding(): void
+    {
+        $uuid = $this->cache->state()->installation_identifier;
+        $signed = $this->platformSnapshot();
+        foreach ([
+            ['installation_uuid' => 'another-installation'],
+            ['product_code' => 'OTHERPRODUCT'],
+            ['credential' => ''],
+        ] as $override) {
+            Http::swap(new Factory);
+            Http::fake(['*' => Http::response(['success' => true, 'data' => $this->exchangeBody($uuid, $signed, $override)], 201)]);
+            $this->post('/license', ['activation_code' => 'KBI-BAD', 'server_url' => 'https://licensing.test'])
+                ->assertSessionHasErrors('activation_code');
+            $this->assertFalse($this->cache->hasUsableLicense());
+            $this->assertNull($this->cache->state()->encrypted_installation_credential);
+        }
+
+        foreach ([['installation_uuid' => 'another-installation'], ['product_code' => 'OTHERPRODUCT']] as $claims) {
+            Http::swap(new Factory);
+            Http::fake(['*' => Http::response(['success' => true, 'data' => $this->exchangeBody($uuid, $this->platformSnapshot($claims))], 201)]);
+            $this->post('/license', ['activation_code' => 'KBI-BAD', 'server_url' => 'https://licensing.test'])
+                ->assertSessionHasErrors('activation_code');
+            $this->assertNull($this->cache->state()->encrypted_installation_credential);
+        }
+    }
+
+    public function test_platform_activation_rejects_tampered_or_untrusted_signatures(): void
+    {
+        $uuid = $this->cache->state()->installation_identifier;
+        $good = $this->platformSnapshot();
+        $tampered = $good;
+        $tampered['payload_json'] = str_replace('"enabled":true', '"enabled":false', $tampered['payload_json']).' ';
+        $unknownKey = array_merge($good, ['key_id' => 'not-trusted']);
+        foreach ([$tampered, $unknownKey] as $signed) {
+            Http::swap(new Factory);
+            Http::fake(['*' => Http::response(['success' => true, 'data' => $this->exchangeBody($uuid, $signed)], 201)]);
+            $this->post('/license', ['activation_code' => 'KBI-SIG', 'server_url' => 'https://licensing.test'])
+                ->assertSessionHasErrors('activation_code');
+            $this->assertFalse($this->cache->hasUsableLicense());
+            $this->assertNull($this->cache->state()->encrypted_installation_credential);
+        }
+    }
+
+    public function test_platform_activation_can_be_retried_after_an_outage_and_verifies_with_the_credential(): void
+    {
+        $uuid = $this->cache->state()->installation_identifier;
+        $signed = $this->platformSnapshot(['platform_account_link_uuid' => 'link-1']);
+        Http::fake(['*' => Http::sequence()
+            ->pushFailedConnection()
+            ->push(['success' => true, 'data' => $this->exchangeBody($uuid, $signed)], 201)
+            ->push(['success' => true, 'data' => $signed], 200)]);
+
+        $this->post('/license', ['activation_code' => 'KBI-RETRY', 'server_url' => 'https://licensing.test'])
+            ->assertSessionHasErrors('activation_code');
+        $this->assertFalse($this->cache->hasUsableLicense());
+        $this->post('/license', ['activation_code' => 'KBI-RETRY', 'server_url' => 'https://licensing.test'])
+            ->assertRedirect(route('installation.setup'));
+        $this->assertTrue($this->cache->hasUsableLicense());
+
+        app(LicenseVerificationService::class)->verify(true);
+        Http::assertSent(fn (ClientRequest $request): bool => str_ends_with($request->url(), '/installations/verify')
+            && $request->header('Authorization') === ['Bearer '.$uuid.'.platform-secret']);
+    }
+
+    public function test_direct_activation_keeps_direct_source_and_local_state(): void
+    {
+        $this->activateWithFramework(['mediflow.module.pharmacy' => ['type' => 'capability', 'enabled' => true]], ['pharmacy']);
+        $diagnostics = app(ProductEntitlementService::class)->diagnostics();
+        $this->assertSame('direct', $diagnostics['activation_source']);
+        $this->assertSame('direct', $diagnostics['licensing_mode']);
+        $this->assertTrue($this->cache->hasUsableLicense());
+
+        $this->cache->reset();
+        $this->activate();
+        $this->assertSame('legacy_key', app(ProductEntitlementService::class)->diagnostics()['activation_source']);
+    }
+
+    public function test_platform_account_page_supports_code_only_and_legacy_binding(): void
+    {
+        Http::fake();
+        $this->get('/license/platform-account')->assertOk()
+            ->assertSee('name="installation_uuid"', false)
+            ->assertSee('Leave this blank for newly generated server activation codes.')
+            ->assertSee('name="activation_code"', false);
+        Http::assertNothingSent();
+    }
+
+    public function test_platform_registered_installation_uuid_is_bound_and_consumed_exactly(): void
+    {
+        $platformUuid = (string) Str::uuid();
+        $local = $this->cache->state()->installation_identifier;
+        $this->assertNotSame($platformUuid, $local);
+        $signed = $this->platformSnapshot(['installation_uuid' => $platformUuid]);
+        Http::fake(['*' => Http::response(['success' => true, 'data' => $this->exchangeBody($platformUuid, $signed)], 201)]);
+
+        $this->post('/license', [
+            'activation_code' => 'KBI-PLATFORM', 'installation_uuid' => strtoupper($platformUuid),
+            'server_url' => 'https://licensing.test',
+        ])->assertRedirect(route('installation.setup'));
+
+        Http::assertSent(fn (ClientRequest $request): bool => str_ends_with($request->url(), '/installations/activate')
+            && $request->data()['installation_uuid'] === $platformUuid);
+        $state = $this->cache->state();
+        $this->assertSame($platformUuid, $state->installation_identifier);
+        $this->assertSame('installation_bearer', $state->credential_kind);
+        $this->assertTrue($this->cache->hasUsableLicense());
+    }
+
+    public function test_platform_uuid_mismatch_and_invalid_input_are_rejected_without_credentials(): void
+    {
+        $platformUuid = (string) Str::uuid();
+        $other = (string) Str::uuid();
+        $this->post('/license', ['activation_code' => 'KBI-X', 'installation_uuid' => 'not-a-uuid', 'server_url' => 'https://licensing.test'])
+            ->assertSessionHasErrors('installation_uuid');
+
+        Http::fake(['*' => Http::response(['success' => false, 'message' => 'The activation code is not bound to this installation.', 'error' => ['code' => 'invalid_activation_code']], 422)]);
+        $this->post('/license', ['activation_code' => 'KBI-X', 'installation_uuid' => $platformUuid, 'server_url' => 'https://licensing.test'])
+            ->assertSessionHasErrors('activation_code');
+        $this->assertNull($this->cache->state()->encrypted_installation_credential);
+        $this->assertFalse($this->cache->hasUsableLicense());
+
+        Http::swap(new Factory);
+        $signed = $this->platformSnapshot(['installation_uuid' => $other]);
+        Http::fake(['*' => Http::response(['success' => true, 'data' => $this->exchangeBody($other, $signed)], 201)]);
+        $this->post('/license', ['activation_code' => 'KBI-X', 'installation_uuid' => $platformUuid, 'server_url' => 'https://licensing.test'])
+            ->assertSessionHasErrors('activation_code');
+        $this->assertNull($this->cache->state()->encrypted_installation_credential);
+    }
+
+    public function test_bound_platform_uuid_survives_outage_retry_and_cannot_change_after_activation(): void
+    {
+        $platformUuid = (string) Str::uuid();
+        $signed = $this->platformSnapshot(['installation_uuid' => $platformUuid]);
+        Http::fake(['*' => Http::sequence()
+            ->pushFailedConnection()
+            ->push(['success' => true, 'data' => $this->exchangeBody($platformUuid, $signed)], 201)]);
+        $payload = ['activation_code' => 'KBI-RETRY', 'installation_uuid' => $platformUuid, 'server_url' => 'https://licensing.test'];
+
+        $this->post('/license', $payload)->assertSessionHasErrors('activation_code');
+        $this->assertSame($platformUuid, $this->cache->state()->installation_identifier);
+        $this->post('/license', $payload)->assertRedirect(route('installation.setup'));
+        $this->assertTrue($this->cache->hasUsableLicense());
+
+        $this->post('/license', ['activation_code' => 'KBI-N', 'installation_uuid' => (string) Str::uuid(), 'server_url' => 'https://licensing.test'])
+            ->assertSessionHasErrors('installation_uuid');
+        $this->assertSame($platformUuid, $this->cache->state()->installation_identifier);
+    }
+
+    public function test_direct_activation_without_binding_keeps_local_installation_uuid(): void
+    {
+        $local = $this->cache->state()->installation_identifier;
+        $this->fakeActivation();
+        $this->post('/license', ['license_key' => 'KBT-TEST', 'server_url' => 'https://licensing.test'])
+            ->assertRedirect(route('installation.setup'));
+        $this->assertSame($local, $this->cache->state()->installation_identifier);
+        $this->post('/license', ['license_key' => 'KBT-TEST', 'installation_uuid' => (string) Str::uuid()])
+            ->assertSessionHasErrors('installation_uuid');
+        $this->assertSame($local, $this->cache->state()->installation_identifier);
+    }
+
+    public function test_insight_catalog_uses_verified_effective_module_grants(): void
+    {
+        $catalog = app(\App\Services\InsightCategoryCatalog::class);
+        $this->assertNull($catalog->availableForInstallation());
+        $this->activateWithFramework([
+            'mediflow.module.pharmacy' => ['type' => 'capability', 'enabled' => true],
+            'mediflow.module.patient_records' => ['type' => 'capability', 'enabled' => false],
+        ], ['pharmacy', 'patient_records']);
+        $keys = array_column($catalog->availableForInstallation(), 'key');
+        $this->assertContains('medicine_stock', $keys);
+        $this->assertNotContains('patients', $keys);
+        $this->cache->reset();
+        $this->assertNull($catalog->availableForInstallation());
+    }
+
+    /** @return array{algorithm: string, key_id: string, payload_json: string, signature: string} */
+    private function platformSnapshot(array $claimOverrides = []): array
+    {
+        $keyPair = sodium_crypto_sign_keypair();
+        config(['kernelbridge-licensing.entitlement_public_keys' => [
+            'platform-test-key' => base64_encode(sodium_crypto_sign_publickey($keyPair)),
+        ]]);
+        $claims = array_merge([
+            'version' => 1,
+            'issued_at' => now()->toIso8601String(),
+            'product_code' => 'MEDIFLOW',
+            'licensing_mode' => 'platform_account',
+            'licensing_policy_revision' => 1,
+            'licensing_policy_effective_at' => null,
+            'installation_uuid' => $this->cache->state()->installation_identifier,
+            'platform_account_link_uuid' => 'link-1',
+            'business_uuid' => 'business-1',
+            'license_uuid' => 'license-platform-test',
+            'license_status' => 'active',
+            'subscription_uuid' => 'subscription-platform-test',
+            'plan' => ['uuid' => 'plan-platform-test', 'name' => 'Test'],
+            'expires_at' => now()->addYear()->toIso8601String(),
+            'grace_expires_at' => null,
+            'entitlements' => [['key' => 'core', 'name' => 'Core', 'enabled' => true, 'limit' => null]],
+            'entitlement_revision' => 1,
+            'entitlement_digest' => 'test',
+        ], $claimOverrides);
+        $payloadJson = json_encode($claims, JSON_THROW_ON_ERROR | JSON_UNESCAPED_SLASHES);
+
+        return [
+            'payload_json' => $payloadJson,
+            'signature' => base64_encode(sodium_crypto_sign_detached($payloadJson, sodium_crypto_sign_secretkey($keyPair))),
+            'algorithm' => 'ed25519',
+            'key_id' => 'platform-test-key',
+        ];
+    }
+
+    private function exchangeBody(string $uuid, array $signed, array $override = []): array
+    {
+        return array_merge([
+            'installation_uuid' => $uuid,
+            'license_uuid' => 'license-platform-test',
+            'product_code' => 'MEDIFLOW',
+            'credential_type' => 'bearer',
+            'credential' => $uuid.'.platform-secret',
+            'signed_entitlements' => $signed,
+        ], $override);
     }
 
     private function setupData(): array

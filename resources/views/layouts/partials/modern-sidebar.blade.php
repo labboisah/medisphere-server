@@ -58,6 +58,16 @@
                 <span class="mf-icon-box"><i class="bi bi-sliders"></i></span>
                 <span x-show="! sidebarCollapsed">Installation Setup</span>
             </a>
+            <a href="{{ route('admin.insight-sharing') }}" class="mf-sidebar-link {{ request()->routeIs('admin.insight-sharing') ? 'mf-sidebar-link-active' : '' }}" title="Insight synchronization">
+                <span class="mf-icon-box"><i class="bi bi-bar-chart"></i></span>
+                <span x-show="! sidebarCollapsed">Insight synchronization</span>
+            </a>
+            @if(config('operational_sync.management_enabled'))
+                <a href="{{ route('admin.installation') }}#operational-sync" class="mf-sidebar-link" title="Operational sync">
+                    <span class="mf-icon-box"><i class="bi bi-arrow-repeat"></i></span>
+                    <span x-show="! sidebarCollapsed">Operational sync</span>
+                </a>
+            @endif
         @endif
 
         @foreach($sidebarGroups as $group)

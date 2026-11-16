@@ -9,6 +9,44 @@
         @if($savedMessage)
             <div role="status" class="rounded-md border border-med-primary bg-white p-4 text-med-primary">{{ $savedMessage }}</div>
         @endif
+        @if($operationalSync !== null)
+            <section id="operational-sync" aria-label="Operational sync">
+            <x-ui.card title="Operational sync" subtitle="Only operational health and enabled modules are queued; patient and financial records are not sent.">
+                @if(config('operational_sync.allow_insecure_ip_http') && app()->environment(['local', 'testing']) && str_starts_with((string) config('operational_sync.platform_api_url'), 'http://'))
+                    <p role="alert" class="mb-3 text-med-danger">Local test mode: HTTP does not encrypt the sync code, credential, or server health data. Use only a trusted test network and synthetic data; use HTTPS for real deployments.</p>
+                @endif
+                @if($operationalSyncMessage)<p role="status" class="mb-3 text-med-primary">{{ $operationalSyncMessage }}</p>@endif
+                @if(session('operational_sync_status'))<p role="status" class="mb-3 text-med-primary">{{ session('operational_sync_status') }}</p>@endif
+                @if($errors->has('sync_code'))<p role="alert" class="mb-3 text-med-danger">{{ $errors->first('sync_code') }}</p>@endif
+                <p class="mb-3">Connection: {{ ! empty($operationalSync['connection']?->encrypted_credential) ? 'enrolled' : 'not enrolled' }}. Enrollment does not by itself start the connector.</p>
+                <p class="mb-3">Generate a sync enrollment code for this server in the MediFlow Platform under Operational sync. Automatic delivery requires the connector and schedulers to be running.</p>
+                @if(! empty($operationalSync['connection']?->encrypted_pending_code))<p role="alert" class="mb-3 text-med-danger">Enrollment is incomplete. Retry with the same code to recover the response.</p>@endif
+                <form method="post" action="{{ route('admin.installation.operational-sync.enroll') }}" class="mb-4">
+                    @csrf
+                    <label for="operational-sync-code" class="block font-semibold">Platform sync enrollment code</label>
+                    <input id="operational-sync-code" name="sync_code" type="password" maxlength="43" autocomplete="off" required>
+                    <button type="submit" class="ml-3 font-semibold underline">Enroll or rotate sync credential</button>
+                </form>
+                @if($errors->has('event'))<p role="alert" class="mb-3 text-med-danger">{{ $errors->first('event') }}</p>@endif
+                <p>Pending or retrying: {{ $operationalSync['pending'] }}. Failed: {{ $operationalSync['failed'] }}.</p>
+                @if($operationalSync['pending'] + $operationalSync['failed'] >= 9000)
+                    <p role="alert" class="my-3 text-med-danger">The operational sync outbox is approaching its 10,000-message capacity. Restore connectivity or resolve failed messages.</p>
+                @endif
+                @if($operationalSync['failed'])
+                    <p role="alert" class="my-3 text-med-danger">Failed messages block later messages. Resolve the cause before requesting retry.</p>
+                    <ul class="space-y-3">
+                        @foreach($operationalSync['events'] as $event)
+                            <li wire:key="operational-event-{{ $event->id }}" class="rounded border border-med-line p-3">
+                                <span>Sequence {{ $event->sequence }} · Attempts {{ $event->attempts }} · Error {{ $event->last_error_code ?: 'unknown' }} · Queued {{ $event->created_at }}</span>
+                                <button type="button" class="ml-3 font-semibold underline" wire:click="retryOperationalEvent('{{ $event->id }}')" wire:loading.attr="disabled" wire:target="retryOperationalEvent">Request retry</button>
+                            </li>
+                        @endforeach
+                    </ul>
+                    @if($operationalSync['failed'] > 25)<p class="mt-3 text-sm">Showing the first 25 failed messages in sequence order.</p>@endif
+                @endif
+            </x-ui.card>
+            </section>
+        @endif
         <form wire:submit="saveBranding" class="space-y-6">
             <x-ui.card title="System branding" subtitle="Branding changes are saved separately from package access.">
                 @if($brandingMessage)<p role="status" class="mb-4 text-sm text-med-primary">{{ $brandingMessage }}</p>@endif
@@ -90,6 +128,10 @@
                 @if($errors->has('license_key'))<p role="alert" class="mb-3 text-med-danger">{{ $errors->first('license_key') }}</p>@endif
                 <form method="post" action="{{ route('kernelbridge.license.verify') }}" class="mb-4">@csrf<button type="submit" class="rounded-md bg-med-primary px-4 py-2 text-white">Refresh subscription</button></form>
                 <dl class="mb-4 grid gap-2 rounded-md border border-med-line p-4 text-sm md:grid-cols-2">
+                    <div><dt class="font-semibold">Activation source</dt><dd>{{ str_replace('_', ' ', $entitlementDiagnostics['activation_source'] ?? 'not activated') }}</dd></div>
+                    <div><dt class="font-semibold">Installation ID</dt><dd class="break-all">{{ $entitlementDiagnostics['installation_uuid'] ?? 'not available' }}</dd></div>
+                    <div><dt class="font-semibold">Signature</dt><dd>{{ ! empty($entitlementDiagnostics['signature_verified']) ? 'Verified' : 'Not verified' }}</dd></div>
+                    <div><dt class="font-semibold">Snapshot issued</dt><dd>{{ $entitlementDiagnostics['snapshot_issued_at'] ?? 'not available' }}</dd></div>
                     <div><dt class="font-semibold">Entitlement source</dt><dd>{{ $entitlementDiagnostics['source'] ?? 'unavailable' }}</dd></div>
                     <div><dt class="font-semibold">License status</dt><dd>{{ $entitlementDiagnostics['license_status'] ?? 'unknown' }}{{ empty($entitlementDiagnostics['license_usable']) ? ' ('.$entitlementDiagnostics['license_reason'].')' : '' }}</dd></div>
                     <div><dt class="font-semibold">Catalog revision</dt><dd>{{ $entitlementDiagnostics['catalog_revision'] ?? 'not available' }}</dd></div>

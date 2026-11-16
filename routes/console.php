@@ -134,3 +134,37 @@ Artisan::command('installation:admin {email} {--revoke}', function () {
 
 \Illuminate\Support\Facades\Schedule::command('partners:deliver')->everyMinute()->withoutOverlapping()
     ->when(fn()=>\Illuminate\Support\Facades\Schema::hasTable('partner_outbox') && app(\App\Services\LicenseService::class)->moduleEnabled('partner_network'));
+
+Artisan::command('operational-sync:heartbeat', function () {
+    if (! config('operational_sync.connector_enabled')) {
+        $this->error('Operational sync connector is disabled.');
+
+        return 1;
+    }
+    app(\App\Services\OperationalSyncConnector::class)->heartbeat();
+    $this->info('Operational health queued.');
+})->purpose('Queue operational health for the enrolled Platform');
+
+Artisan::command('operational-sync:deliver', function () {
+    if (! config('operational_sync.connector_enabled')) {
+        $this->error('Operational sync connector is disabled.');
+
+        return 1;
+    }
+    $result = app(\App\Services\OperationalSyncConnector::class)->deliver();
+    if (in_array($result, ['failed', 'blocked', 'lease_lost'], true)) {
+        $this->error('Operational sync requires administrator attention: '.$result);
+
+        return 1;
+    }
+    $this->info('Operational sync delivery: '.$result);
+})->purpose('Deliver the next operational health event');
+
+Schedule::command('operational-sync:heartbeat')->everyFiveMinutes()->withoutOverlapping(2)
+    ->when(fn (): bool => (bool) config('operational_sync.connector_enabled'));
+Schedule::command('operational-sync:deliver')->everyMinute()->withoutOverlapping(2)
+    ->when(fn (): bool => (bool) config('operational_sync.connector_enabled'));
+Schedule::call(fn () => \Illuminate\Support\Facades\DB::table('operational_sync_outbox')
+    ->where('status', 'acknowledged')->where('acknowledged_at', '<=', now()->subDays(30))->delete())
+    ->name('purge-acknowledged-operational-sync-events')->daily()->withoutOverlapping()
+    ->when(fn (): bool => (bool) config('operational_sync.connector_enabled'));

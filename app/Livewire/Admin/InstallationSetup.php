@@ -9,6 +9,7 @@ use App\Models\User;
 use App\Services\CentralLicenseService;
 use App\Services\InstallationAdministrator;
 use App\Services\LicenseService;
+use App\Services\OperationalHealthRetry;
 use App\Services\SystemBranding;
 use Carbon\Carbon;
 use Illuminate\Support\Facades\DB;
@@ -50,6 +51,8 @@ class InstallationSetup extends Component
     public string $brandingMessage = '';
 
     public string $administratorMessage = '';
+
+    public string $operationalSyncMessage = '';
 
     public string $adminName = '';
 
@@ -323,9 +326,30 @@ class InstallationSetup extends Component
         }
     }
 
+    public function retryOperationalEvent(string $eventId, OperationalHealthRetry $retry): void
+    {
+        abort_unless(config('operational_sync.management_enabled'), 404);
+        $this->operationalSyncMessage = '';
+        $retry->retry(auth()->user(), $eventId);
+        $this->operationalSyncMessage = 'Retry requested. The message remains queued until the connector sends it.';
+    }
+
     public function render()
     {
+        $operationalSync = null;
+        if (config('operational_sync.management_enabled')) {
+            $operationalSync = [
+                'connection' => DB::table('operational_sync_connection')->where('id', 1)
+                    ->select('installation_uuid', 'encrypted_credential', 'encrypted_pending_code')->first(),
+                'pending' => DB::table('operational_sync_outbox')->whereIn('status', ['pending', 'retry'])->count(),
+                'failed' => DB::table('operational_sync_outbox')->where('status', 'failed')->count(),
+                'events' => DB::table('operational_sync_outbox')->where('status', 'failed')
+                    ->orderBy('sequence')->limit(25)->get(['id', 'sequence', 'attempts', 'last_error_code', 'created_at']),
+            ];
+        }
+
         return view('components.admin.installation-setup', [
+            'operationalSync' => $operationalSync,
             'entitlementDiagnostics' => config('central_licensing.enabled') ? app(CentralLicenseService::class)->entitlementDiagnostics() : [],
             'administratorEmail' => User::find(app(SystemBranding::class)->settings()?->administrator_user_id)?->email,
             'welcomeTemplates' => config('welcome_templates'),
